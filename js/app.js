@@ -500,13 +500,7 @@ function initEventListeners() {
 
 // Function to detect preferred language based on browser settings
 function getPreferredLanguage() {
-  const browserLang = navigator.language || navigator.userLanguage;
-  // Check if browser is set to Chinese variants
-  if (browserLang.startsWith('zh')) {
-    return 'Chinese';
-  }
-  // Default to Chinese for all other languages
-  return 'Chinese';
+  return DATA_CONFIG.language === 'Chinese' ? 'Chinese' : 'English';
 }
 
 // Function to select the best available language for a date
@@ -514,7 +508,7 @@ function selectLanguageForDate(date, preferredLanguage = null) {
   const availableLanguages = window.dateLanguageMap?.get(date) || [];
   
   if (availableLanguages.length === 0) {
-    return 'Chinese'; // fallback
+    return getPreferredLanguage(); // repository edition
   }
   
   // Use provided preference or detect from browser
@@ -526,7 +520,7 @@ function selectLanguageForDate(date, preferredLanguage = null) {
   }
   
   // Fallback: prefer Chinese if available, otherwise use the first available
-  return availableLanguages.includes('Chinese') ? 'Chinese' : availableLanguages[0];
+  return availableLanguages.includes(getPreferredLanguage()) ? getPreferredLanguage() : availableLanguages[0];
 }
 
 async function fetchAvailableDates() {
@@ -693,7 +687,7 @@ async function loadPapersByDate(date) {
     
     paperData = parseJsonlData(text, date);
     
-    const categories = getAllCategories(paperData);
+    const categories = getAllCategories(paperData, DATA_CONFIG.categories);
     
     renderCategoryFilter(categories);
     
@@ -709,80 +703,11 @@ async function loadPapersByDate(date) {
   }
 }
 
-function parseJsonlData(jsonlText, date) {
-  const result = {};
-  
-  const lines = jsonlText.trim().split('\n');
-  
-  lines.forEach(line => {
-    try {
-      const paper = JSON.parse(line);
-      
-      if (!paper.categories) {
-        return;
-      }
-      
-      let allCategories = Array.isArray(paper.categories) ? paper.categories : [paper.categories];
-      
-      const primaryCategory = allCategories[0];
-      
-      if (!result[primaryCategory]) {
-        result[primaryCategory] = [];
-      }
-      
-      const summary = paper.AI && paper.AI.tldr ? paper.AI.tldr : paper.summary;
-      
-      result[primaryCategory].push({
-        title: paper.title,
-        url: paper.abs || paper.pdf || `https://arxiv.org/abs/${paper.id}`,
-        authors: Array.isArray(paper.authors) ? paper.authors.join(', ') : paper.authors,
-        category: allCategories,
-        summary: summary,
-        details: paper.summary || '',
-        date: date,
-        id: paper.id,
-        motivation: paper.AI && paper.AI.motivation ? paper.AI.motivation : '',
-        method: paper.AI && paper.AI.method ? paper.AI.method : '',
-        result: paper.AI && paper.AI.result ? paper.AI.result : '',
-        conclusion: paper.AI && paper.AI.conclusion ? paper.AI.conclusion : '',
-        code_url: paper.code_url || '',
-        code_stars: paper.code_stars || 0,
-        code_last_update: paper.code_last_update || ''
-      });
-    } catch (error) {
-      console.error('解析JSON行失败:', error, line);
-    }
-  });
-  
-  return result;
-}
-
-// 获取所有类别并按偏好排序
-function getAllCategories(data) {
-  const categories = Object.keys(data);
-  const catePaperCount = {};
-  
-  categories.forEach(category => {
-    catePaperCount[category] = data[category] ? data[category].length : 0;
-  });
-  
-  return {
-    sortedCategories: categories.sort((a, b) => {
-      return a.localeCompare(b);
-    }),
-    categoryCounts: catePaperCount
-  };
-}
-
 function renderCategoryFilter(categories) {
   const container = document.querySelector('.category-scroll');
-  const { sortedCategories, categoryCounts } = categories;
-  
-  let totalPapers = 0;
-  Object.values(categoryCounts).forEach(count => {
-    totalPapers += count;
-  });
-  
+  const { sortedCategories, categoryCounts, totalCount = 0 } = categories;
+  const totalPapers = totalCount;
+
   container.innerHTML = `
     <button class="category-button ${currentCategory === 'all' ? 'active' : ''}" data-category="all">All<span class="category-count">${totalPapers}</span></button>
   `;
@@ -902,18 +827,8 @@ function renderPapers() {
   container.innerHTML = '';
   container.className = `paper-container ${currentView === 'list' ? 'list-view' : ''}`;
   
-  let papers = [];
-  if (currentCategory === 'all') {
-    const { sortedCategories } = getAllCategories(paperData);
-    sortedCategories.forEach(category => {
-      if (paperData[category]) {
-        papers = papers.concat(paperData[category]);
-      }
-    });
-  } else if (paperData[currentCategory]) {
-    papers = paperData[currentCategory];
-  }
-  
+  const papers = papersForCategory(paperData, currentCategory);
+
   // 创建匹配论文的集合
   let filteredPapers = [...papers];
 
@@ -1213,6 +1128,7 @@ function renderPapers() {
         </div>
       </div>
       <div class="paper-card-body">
+        ${!paper.aiAvailable ? '<p class="ai-summary-status">AI summary unavailable; showing the original abstract.</p>' : ''}
         <p class="paper-card-summary">${highlightedSummary}</p>
         <div class="paper-card-footer">
           <div class="footer-left">
@@ -1309,7 +1225,7 @@ function showPaperDetails(paper, paperIndex) {
       <p><strong>Date: </strong>${formatDate(paper.date)}</p>
       
       
-      <h3>TL;DR</h3>
+      <h3>${paper.aiAvailable ? 'TL;DR' : 'Original abstract (AI summary unavailable)'}</h3>
       <p>${highlightedSummary}</p>
       
       <div class="paper-sections">
@@ -1319,7 +1235,7 @@ function showPaperDetails(paper, paperIndex) {
         ${paper.conclusion ? `<div class="paper-section"><h4>Conclusion</h4><p>${highlightedConclusion}</p></div>` : ''}
       </div>
       
-      ${highlightedAbstract ? `<h3>Abstract</h3><p class="original-abstract">${highlightedAbstract}</p>` : ''}
+      ${paper.aiAvailable && highlightedAbstract ? `<h3>Abstract</h3><p class="original-abstract">${highlightedAbstract}</p>` : ''}
       
       <div class="pdf-preview-section">
         <div class="pdf-header">
@@ -1527,7 +1443,7 @@ async function loadPapersByDateRange(startDate, endDate) {
     
     paperData = allPaperData;
     
-    const categories = getAllCategories(paperData);
+    const categories = getAllCategories(paperData, DATA_CONFIG.categories);
     
     renderCategoryFilter(categories);
     
