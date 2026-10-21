@@ -1,0 +1,139 @@
+name: Stage missing 2026-10-20 papers
+on:
+  workflow_dispatch:
+    inputs:
+      generate:
+        description: Generate candidates after crawling missing IDs (false only crawls and audits)
+        default: false
+        type: boolean
+      ids:
+        description: Optional comma-separated IDs within the reviewed inventory
+        default: ''
+        type: string
+      resume_run_id:
+        description: Previous backfill run ID; also provide its artifact name
+        default: ''
+        type: string
+      resume_artifact_name:
+        description: Exact arxiv-backfill-RUN-ATTEMPT artifact name
+        default: ''
+        type: string
+      metadata_run_id:
+        description: Successful audit-only backfill run to reuse when arXiv is unavailable
+        default: ''
+        type: string
+      metadata_artifact_name:
+        description: Exact audit-only arxiv-backfill-RUN-ATTEMPT artifact name; excludes resume
+        default: ''
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: code
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: data
+          path: published
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+        working-directory: code
+      - name: Validate resume selector and workflow
+        working-directory: code
+        env:
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          RESUME_ARTIFACT_NAME: ${{ inputs.resume_artifact_name }}
+          METADATA_RUN_ID: ${{ inputs.metadata_run_id }}
+          METADATA_ARTIFACT_NAME: ${{ inputs.metadata_artifact_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          uv run --frozen python scripts/resume_artifact.py --kind append --check-selector \
+            --run-id "$RESUME_RUN_ID" --name "$RESUME_ARTIFACT_NAME" \
+            --metadata-run-id "$METADATA_RUN_ID" --metadata-name "$METADATA_ARTIFACT_NAME"
+          artifact_run="$RESUME_RUN_ID"
+          if [ -n "$METADATA_RUN_ID" ]; then artifact_run="$METADATA_RUN_ID"; fi
+          if [ -n "$artifact_run" ]; then
+            path=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run" --jq '.path')
+            test "$path" = '.github/workflows/backfill.yml'
+            repo=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run" --jq '.head_repository.full_name')
+            test "$repo" = "$GITHUB_REPOSITORY"
+            if [ -n "$METADATA_RUN_ID" ]; then
+              conclusion=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$artifact_run" --jq '.conclusion')
+              test "$conclusion" = 'success'
+            fi
+          fi
+      - uses: actions/download-artifact@v4
+        if: inputs.resume_run_id != ''
+        with:
+          name: ${{ inputs.resume_artifact_name }}
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/arxiv-backfill-resume
+      - uses: actions/download-artifact@v4
+        if: inputs.metadata_run_id != ''
+        with:
+          name: ${{ inputs.metadata_artifact_name }}
+          run-id: ${{ inputs.metadata_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/arxiv-backfill-metadata
+      - name: Fetch only missing archived IDs
+        id: crawl
+        working-directory: code
+        env:
+          IDS: ${{ inputs.ids }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          METADATA_RUN_ID: ${{ inputs.metadata_run_id }}
+          METADATA_ARTIFACT_NAME: ${{ inputs.metadata_artifact_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/arxiv-backfill"
+          git -C ../published rev-parse HEAD > "$RUNNER_TEMP/arxiv-backfill/source-commit.txt"
+          resume=()
+          if [ -n "$RESUME_RUN_ID" ]; then
+            resume+=(--resume "$RUNNER_TEMP/arxiv-backfill-resume")
+          elif [ -n "$METADATA_RUN_ID" ]; then
+            resume+=(--snapshot "$RUNNER_TEMP/arxiv-backfill-metadata" \
+              --metadata-run-id "$METADATA_RUN_ID" --metadata-name "$METADATA_ARTIFACT_NAME")
+          else
+            uv run --frozen python daily_arxiv/crawl.py \
+              --inventory docs/audits/arxiv-2026-10-20.json --ids "$IDS" --history-dir ../published/data \
+              --output "$RUNNER_TEMP/arxiv-backfill/2026-10-20.jsonl" \
+              --audit "$RUNNER_TEMP/arxiv-backfill/coverage.json"
+          fi
+          uv run --frozen python scripts/resume_artifact.py --kind append --source ../published \
+            --output "$RUNNER_TEMP/arxiv-backfill" --ids "$IDS" "${resume[@]}"
+          if [ -s "$RUNNER_TEMP/arxiv-backfill/2026-10-20.jsonl" ]; then
+            echo 'has_new=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'has_new=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Generate and stage new rows
+        if: inputs.generate && steps.crawl.outputs.has_new == 'true'
+        working-directory: code
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: |
+          set -euo pipefail
+          resume=()
+          if [ -n "$RESUME_RUN_ID" ]; then resume+=(--resume "$RUNNER_TEMP/arxiv-backfill-resume/ready/checkpoint.json"); fi
+          uv run --frozen python scripts/stage_daily.py --source ../published --date 2026-10-20 \
+            --raw "$RUNNER_TEMP/arxiv-backfill/2026-10-20.jsonl" \
+            --output "$RUNNER_TEMP/arxiv-backfill/ready" \
+            --coverage "$RUNNER_TEMP/arxiv-backfill/coverage.json" "${resume[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arxiv-backfill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/arxiv-backfill/
+          if-no-files-found: ignore
+          retention-days: 14
